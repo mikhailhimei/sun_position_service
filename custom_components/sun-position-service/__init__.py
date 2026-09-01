@@ -10,6 +10,7 @@ from astral import LocationInfo
 from astral.sun import azimuth, elevation
 import voluptuous as vol
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -36,13 +37,11 @@ CoverStateType = Literal["open", "side", "slightly", "direct"]
 
 
 def _angle_diff(a: float, b: float) -> float:
-    """Вычисляет минимальную угловую разницу между двумя направлениями."""
     diff = abs(a - b) % 360.0
     return diff if diff <= 180.0 else 360.0 - diff
 
 
 def _get_altitude_factor(sun_altitude: float) -> float:
-    """Коэффициент проникновения солнечного потока в проем."""
     if sun_altitude <= 0:
         return 0.0
     if sun_altitude < 5:
@@ -57,7 +56,6 @@ def _get_altitude_factor(sun_altitude: float) -> float:
 
 
 def _calculate_single_azimuth_coverage(sun_az: float, sun_alt: float, target_az: float) -> float:
-    """Расчет геометрического покрытия для одиночного направления."""
     diff = _angle_diff(sun_az, target_az)
     direct_limit = min(max(6.0, 30.0 - sun_alt * 0.6), 20.0)
     side_limit = direct_limit * 2.5
@@ -71,19 +69,16 @@ def _calculate_blind_state(
     lux: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
-    """Расчет положения шторы с гистерезисом по эффективному потоку света."""
     if geom_result == "open" or geom_coverage < 5.0 or lux < 100.0:
         return "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
 
-    # 1. Выход из direct
     if current_state == "direct":
         if effective_lux < 4000.0 or geom_coverage < 30.0:
             return "side" if geom_result in ("direct", "side") else "slightly"
         return "direct"
 
-    # 2. Выход из side
     if current_state == "side":
         if effective_lux >= 7000.0 and geom_result == "direct":
             return "direct"
@@ -91,7 +86,6 @@ def _calculate_blind_state(
             return "open"
         return "side"
 
-    # 3. Выход из slightly
     if current_state == "slightly":
         if effective_lux >= 8000.0 and geom_result == "direct":
             return "direct"
@@ -99,7 +93,6 @@ def _calculate_blind_state(
             return "open"
         return "slightly"
 
-    # 4. Базовый переход из open
     if effective_lux >= 6000.0 and geom_result == "direct":
         return "direct"
     if effective_lux >= 2000.0 and geom_result in ("direct", "side"):
@@ -122,8 +115,10 @@ SERVICE_SCHEMA = vol.Schema(
 )
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Инициализация интеграции и регистрация сервиса."""
+def _register_services(hass: HomeAssistant) -> None:
+    """Регистрация сервиса в HA."""
+    if hass.services.has_service(DOMAIN, SERVICE_GET_STATE):
+        return
 
     def handle_get_state(call: ServiceCall) -> ServiceResponse:
         loc = LocationInfo(
@@ -145,8 +140,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         }
 
         current_lum: float | None = call.data.get(ATTR_LUM)
-
-        # Определение предыдущего состояния
         last_state: CoverStateType = call.data.get(ATTR_PREVIOUS_STATE, "open")
         cover_entity: str | None = call.data.get(ATTR_COVER_ENTITY_ID)
 
@@ -155,7 +148,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             if cover_state_obj and cover_state_obj.state in ("open", "side", "slightly", "direct"):
                 last_state = cover_state_obj.state  # type: ignore[assignment]
 
-        # Ночь
         if sun_alt <= 0:
             return {
                 "result": "open",
@@ -166,7 +158,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 **sun_info,
             }
 
-        # Нормализация азимутов
         raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
         if raw_azimuths is None:
             az_list: list[float] = []
@@ -185,7 +176,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 **sun_info,
             }
 
-        # Расчет геометрического покрытия окна
         if len(az_list) == 1:
             coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, az_list[0])
         else:
@@ -212,7 +202,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
         coverage = round(max(0.0, min(100.0, coverage)), 1)
 
-        # Категоризация геометрии
         if coverage >= 70.0:
             geom_result: GeomResultType = "direct"
         elif coverage >= 35.0:
@@ -222,7 +211,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         else:
             geom_result = "open"
 
-        # Формирование итогового статуса
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
             result = _calculate_blind_state(
@@ -249,4 +237,19 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Поддержка конфигурации через YAML (configuration.yaml)."""
+    _register_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Поддержка добавления через UI (Настройки -> Интеграции)."""
+    _register_services(hass)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Удаление интеграции через UI."""
     return True
