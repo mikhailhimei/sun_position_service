@@ -1,11 +1,13 @@
 {
-  "domain": "sun-position-service",
+  "domain": "sun_position_service",
   "name": "Sun Position & Blind Controller",
-  "codeowners": ["@sun_position_service"],
-  "documentation": "https://github.com/mikhailhimei/sun_position_service.git",
+  "codeowners": ["@mikhailhimei"],
+  "documentation": "https://github.com/mikhailhimei/sun_position_service",
+  "issue_tracker": "https://github.com/mikhailhimei/sun_position_service/issues",
   "integration_type": "service",
+  "config_flow": true,
   "dependencies": [],
   "requirements": ["astral>=3.2", "pytz>=2024.1"],
-  "version": "1.0.0",
+  "version": "0.0.2",
   "iot_class": "calculated"
 }
