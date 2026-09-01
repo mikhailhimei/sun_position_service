@@ -19,8 +19,8 @@ get_state:
           mode: box
     previous_state:
       name: Previous State
-      description: Current blind state string (optional).
-      example: "side"
+      description: Current state of the blind to apply hysteresis.
+      default: "open"
       selector:
         select:
           options:
@@ -28,9 +28,3 @@ get_state:
             - "side"
             - "slightly"
             - "direct"
-    cover_entity_id:
-      name: Cover / State Entity
-      description: Entity (cover or input_select) to read previous state from.
-      example: input_select.living_room_blind_state
-      selector:
-        entity:

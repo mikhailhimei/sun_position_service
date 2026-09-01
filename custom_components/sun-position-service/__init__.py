@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import logging
-from typing import Literal
+from typing import Final, Literal
 
 from astral import LocationInfo
 from astral.sun import azimuth, elevation
@@ -17,12 +16,10 @@ from homeassistant.core import (
     ServiceResponse,
     SupportsResponse,
 )
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 import homeassistant.util.dt as dt_util
 
 from .const import (
-    ATTR_COVER_ENTITY_ID,
     ATTR_LUM,
     ATTR_PREVIOUS_STATE,
     ATTR_WINDOW_AZIMUTHS,
@@ -35,31 +32,45 @@ _LOGGER = logging.getLogger(__name__)
 GeomResultType = Literal["direct", "side", "slightly", "open"]
 CoverStateType = Literal["open", "side", "slightly", "direct"]
 
+VALID_STATES: Final[tuple[CoverStateType, ...]] = (
+    "open",
+    "side",
+    "slightly",
+    "direct",
+)
+
 
 def _angle_diff(a: float, b: float) -> float:
+    """Вычисляет минимальную угловую разницу между двумя направлениями."""
     diff = abs(a - b) % 360.0
     return diff if diff <= 180.0 else 360.0 - diff
 
 
 def _get_altitude_factor(sun_altitude: float) -> float:
-    if sun_altitude <= 0:
+    """Коэффициент проникновения солнечного потока в проем в зависимости от высоты."""
+    if sun_altitude <= 0.0:
         return 0.0
-    if sun_altitude < 5:
+    if sun_altitude < 5.0:
         return 0.7
-    if sun_altitude < 25:
+    if sun_altitude < 25.0:
         return 1.0
-    if sun_altitude < 45:
+    if sun_altitude < 45.0:
         return 0.9
-    if sun_altitude < 65:
+    if sun_altitude < 65.0:
         return 0.6
     return 0.4
 
 
-def _calculate_single_azimuth_coverage(sun_az: float, sun_alt: float, target_az: float) -> float:
+def _calculate_single_azimuth_coverage(
+    sun_az: float, sun_alt: float, target_az: float
+) -> float:
+    """Расчет геометрического покрытия для одиночного направления."""
     diff = _angle_diff(sun_az, target_az)
     direct_limit = min(max(6.0, 30.0 - sun_alt * 0.6), 20.0)
     side_limit = direct_limit * 2.5
-    base = 100.0 if diff <= direct_limit else (50.0 if diff <= side_limit else 0.0)
+    base = (
+        100.0 if diff <= direct_limit else (50.0 if diff <= side_limit else 0.0)
+    )
     return base * _get_altitude_factor(sun_alt)
 
 
@@ -69,16 +80,19 @@ def _calculate_blind_state(
     lux: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
+    """Расчет положения шторы с гистерезисом по эффективному потоку света."""
     if geom_result == "open" or geom_coverage < 5.0 or lux < 100.0:
         return "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
 
+    # 1. Выход из direct
     if current_state == "direct":
         if effective_lux < 4000.0 or geom_coverage < 30.0:
             return "side" if geom_result in ("direct", "side") else "slightly"
         return "direct"
 
+    # 2. Выход из side
     if current_state == "side":
         if effective_lux >= 7000.0 and geom_result == "direct":
             return "direct"
@@ -86,6 +100,7 @@ def _calculate_blind_state(
             return "open"
         return "side"
 
+    # 3. Выход из slightly
     if current_state == "slightly":
         if effective_lux >= 8000.0 and geom_result == "direct":
             return "direct"
@@ -93,6 +108,7 @@ def _calculate_blind_state(
             return "open"
         return "slightly"
 
+    # 4. Базовый переход из open
     if effective_lux >= 6000.0 and geom_result == "direct":
         return "direct"
     if effective_lux >= 2000.0 and geom_result in ("direct", "side"):
@@ -109,14 +125,13 @@ SERVICE_SCHEMA = vol.Schema(
             vol.Coerce(float), [vol.Coerce(float)], None
         ),
         vol.Optional(ATTR_LUM): vol.Any(vol.Coerce(float), None),
-        vol.Optional(ATTR_PREVIOUS_STATE): vol.In(["open", "side", "slightly", "direct"]),
-        vol.Optional(ATTR_COVER_ENTITY_ID): cv.entity_id,
+        vol.Optional(ATTR_PREVIOUS_STATE, default="open"): vol.In(VALID_STATES),
     }
 )
 
 
 def _register_services(hass: HomeAssistant) -> None:
-    """Регистрация сервиса в HA."""
+    """Регистрация сервиса в Home Assistant."""
     if hass.services.has_service(DOMAIN, SERVICE_GET_STATE):
         return
 
@@ -141,14 +156,9 @@ def _register_services(hass: HomeAssistant) -> None:
 
         current_lum: float | None = call.data.get(ATTR_LUM)
         last_state: CoverStateType = call.data.get(ATTR_PREVIOUS_STATE, "open")
-        cover_entity: str | None = call.data.get(ATTR_COVER_ENTITY_ID)
 
-        if call.data.get(ATTR_PREVIOUS_STATE) is None and cover_entity:
-            cover_state_obj = hass.states.get(cover_entity)
-            if cover_state_obj and cover_state_obj.state in ("open", "side", "slightly", "direct"):
-                last_state = cover_state_obj.state  # type: ignore[assignment]
-
-        if sun_alt <= 0:
+        # Ночной режим
+        if sun_alt <= 0.0:
             return {
                 "result": "open",
                 "geom_result": "open",
@@ -158,6 +168,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 **sun_info,
             }
 
+        # Нормализация азимутов окон
         raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
         if raw_azimuths is None:
             az_list: list[float] = []
@@ -176,14 +187,19 @@ def _register_services(hass: HomeAssistant) -> None:
                 **sun_info,
             }
 
+        # Геометрический расчет покрытия
         if len(az_list) == 1:
-            coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, az_list[0])
+            coverage = _calculate_single_azimuth_coverage(
+                sun_az, sun_alt, az_list[0]
+            )
         else:
             start, end = min(az_list), max(az_list)
             width = end - start
 
-            if width == 0:
-                coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, start)
+            if width == 0.0:
+                coverage = _calculate_single_azimuth_coverage(
+                    sun_az, sun_alt, start
+                )
             elif sun_az < start or sun_az > end:
                 return {
                     "result": "open",
@@ -202,6 +218,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
         coverage = round(max(0.0, min(100.0, coverage)), 1)
 
+        # Категоризация геометрии
         if coverage >= 70.0:
             geom_result: GeomResultType = "direct"
         elif coverage >= 35.0:
@@ -211,6 +228,7 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             geom_result = "open"
 
+        # Расчет итогового состояния с учетом люксов
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
             result = _calculate_blind_state(
@@ -239,17 +257,17 @@ def _register_services(hass: HomeAssistant) -> None:
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Поддержка конфигурации через YAML (configuration.yaml)."""
+    """Поддержка конфигурации через YAML."""
     _register_services(hass)
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Поддержка добавления через UI (Настройки -> Интеграции)."""
+    """Поддержка добавления через UI."""
     _register_services(hass)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Удаление интеграции через UI."""
+    """Выгрузка интеграции."""
     return True
