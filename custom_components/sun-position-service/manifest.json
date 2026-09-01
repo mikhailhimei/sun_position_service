@@ -7,7 +7,7 @@
   "integration_type": "service",
   "config_flow": true,
   "dependencies": [],
-  "requirements": ["astral>=3.2", "pytz>=2024.1"],
-  "version": "0.0.2",
+  "requirements": [],
+  "version": "0.0.8",
   "iot_class": "calculated"
 }
