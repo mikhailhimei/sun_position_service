@@ -1,5 +1,5 @@
 {
-  "domain": "sun_position_service",
+  "domain": "sun-position-service",
   "name": "Sun Position & Blind Controller",
   "codeowners": ["@sun_position_service"],
   "documentation": "https://github.com/mikhailhimei/sun_position_service.git",
