@@ -13,18 +13,11 @@ get_state:
       description: Direct float lux value or template variable.
       example: 10500
       selector:
-        number:
-          min: 0
-          max: 150000
-          mode: box
+        object:
     previous_state:
       name: Previous State
       description: Current state of the blind to apply hysteresis.
       default: "open"
+      example: "open | side | slightly | direct"
       selector:
-        select:
-          options:
-            - "open"
-            - "side"
-            - "slightly"
-            - "direct"
+        object:

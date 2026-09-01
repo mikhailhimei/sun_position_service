@@ -8,6 +8,6 @@
   "config_flow": true,
   "dependencies": [],
   "requirements": [],
-  "version": "0.0.9",
+  "version": "0.1.0",
   "iot_class": "calculated"
 }
