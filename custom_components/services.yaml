@@ -1,0 +1,36 @@
+get_state:
+  name: Get Sunlight State
+  description: Calculates solar coverage and blinds state with hysteresis and lux measurement.
+  fields:
+    window_azimuths:
+      name: Window Azimuth(s)
+      description: Single azimuth (e.g. 110) or range list [40, 135].
+      example: [40, 135]
+      selector:
+        object:
+    lum:
+      name: Illuminance (Lux)
+      description: Direct float lux value or template variable.
+      example: 10500
+      selector:
+        number:
+          min: 0
+          max: 150000
+          mode: box
+    previous_state:
+      name: Previous State
+      description: Current blind state string (optional).
+      example: "side"
+      selector:
+        select:
+          options:
+            - "open"
+            - "side"
+            - "slightly"
+            - "direct"
+    cover_entity_id:
+      name: Cover / State Entity
+      description: Entity (cover or input_select) to read previous state from.
+      example: input_select.living_room_blind_state
+      selector:
+        entity:
