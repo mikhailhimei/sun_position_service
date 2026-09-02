@@ -47,7 +47,7 @@ def _angle_diff(a: float, b: float) -> float:
 
 
 def _get_altitude_factor(sun_altitude: float) -> float:
-    """Коэффициент проникновения солнечного потока в проем в зависимости от высоты."""
+    """Коэффициент проникновения солнечного потока в зависимости от высоты."""
     if sun_altitude <= 0.0:
         return 0.0
     if sun_altitude < 5.0:
@@ -68,9 +68,7 @@ def _calculate_single_azimuth_coverage(
     diff = _angle_diff(sun_az, target_az)
     direct_limit = min(max(6.0, 30.0 - sun_alt * 0.6), 20.0)
     side_limit = direct_limit * 2.5
-    base = (
-        100.0 if diff <= direct_limit else (50.0 if diff <= side_limit else 0.0)
-    )
+    base = 100.0 if diff <= direct_limit else (50.0 if diff <= side_limit else 0.0)
     return base * _get_altitude_factor(sun_alt)
 
 
@@ -78,23 +76,32 @@ def _calculate_blind_state(
     geom_coverage: float,
     geom_result: GeomResultType,
     lux: float,
+    sun_altitude: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
-    """Расчет положения шторы с гистерезисом по эффективному потоку света."""
+    """Расчет положения шторы с адаптивными порогами ослепления и гистерезисом."""
     if geom_result == "open" or geom_coverage < 5.0 or lux < 100.0:
         return "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
 
-    # 1. Выход из direct
+    # При низком солнце (< 25°) свет проникает глубоко вглубь комнаты
+    is_low_sun = 0.0 < sun_altitude <= 25.0
+    side_to_direct_threshold = 8000.0 if is_low_sun else 12000.0
+
+    # 1. Выход из direct (гистерезис на закрытие)
     if current_state == "direct":
-        if effective_lux < 4000.0 or geom_coverage < 30.0:
+        min_lux = 3500.0 if is_low_sun else 4500.0
+        if effective_lux < min_lux or geom_coverage < 25.0:
             return "side" if geom_result in ("direct", "side") else "slightly"
         return "direct"
 
     # 2. Выход из side
     if current_state == "side":
-        if effective_lux >= 7000.0 and geom_result == "direct":
+        # Переход в direct по геометрическому direct ИЛИ по высокой фотометрии при боковом солнце
+        if (effective_lux >= 7000.0 and geom_result == "direct") or (
+            effective_lux >= side_to_direct_threshold and geom_coverage >= 35.0
+        ):
             return "direct"
         if effective_lux < 1200.0:
             return "open"
@@ -102,14 +109,18 @@ def _calculate_blind_state(
 
     # 3. Выход из slightly
     if current_state == "slightly":
-        if effective_lux >= 8000.0 and geom_result == "direct":
+        if (effective_lux >= 8000.0 and geom_result == "direct") or (
+            effective_lux >= side_to_direct_threshold and geom_coverage >= 40.0
+        ):
             return "direct"
         if effective_lux < 800.0:
             return "open"
         return "slightly"
 
     # 4. Базовый переход из open
-    if effective_lux >= 6000.0 and geom_result == "direct":
+    if (effective_lux >= 6000.0 and geom_result == "direct") or (
+        effective_lux >= side_to_direct_threshold and geom_coverage >= 35.0
+    ):
         return "direct"
     if effective_lux >= 2000.0 and geom_result in ("direct", "side"):
         return "side"
@@ -145,7 +156,6 @@ def _register_services(hass: HomeAssistant) -> None:
         )
 
         now_dt = dt_util.now()
-
         sun_az = float(azimuth(loc.observer, now_dt))
         sun_alt = float(elevation(loc.observer, now_dt))
 
@@ -157,7 +167,6 @@ def _register_services(hass: HomeAssistant) -> None:
         current_lum: float | None = call.data.get(ATTR_LUM)
         last_state: CoverStateType = call.data.get(ATTR_PREVIOUS_STATE, "open")
 
-        # Ночной режим
         if sun_alt <= 0.0:
             return {
                 "result": "open",
@@ -168,7 +177,6 @@ def _register_services(hass: HomeAssistant) -> None:
                 **sun_info,
             }
 
-        # Нормализация азимутов окон
         raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
         if raw_azimuths is None:
             az_list: list[float] = []
@@ -187,7 +195,6 @@ def _register_services(hass: HomeAssistant) -> None:
                 **sun_info,
             }
 
-        # Геометрический расчет покрытия
         if len(az_list) == 1:
             coverage = _calculate_single_azimuth_coverage(
                 sun_az, sun_alt, az_list[0]
@@ -218,7 +225,6 @@ def _register_services(hass: HomeAssistant) -> None:
 
         coverage = round(max(0.0, min(100.0, coverage)), 1)
 
-        # Категоризация геометрии
         if coverage >= 70.0:
             geom_result: GeomResultType = "direct"
         elif coverage >= 35.0:
@@ -228,11 +234,10 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             geom_result = "open"
 
-        # Расчет итогового состояния с учетом люксов
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
             result = _calculate_blind_state(
-                coverage, geom_result, current_lum, last_state
+                coverage, geom_result, current_lum, sun_alt, last_state
             )
         else:
             effective_lux = 0.0
