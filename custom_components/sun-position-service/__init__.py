@@ -136,7 +136,11 @@ SERVICE_SCHEMA = vol.Schema(
             vol.Coerce(float), [vol.Coerce(float)], None
         ),
         vol.Optional(ATTR_LUM): vol.Any(vol.Coerce(float), None),
-        vol.Optional(ATTR_PREVIOUS_STATE, default="open"): vol.In(VALID_STATES),
+        vol.Optional(ATTR_PREVIOUS_STATE, default="open"): vol.Any(
+            vol.In(VALID_STATES),
+            None,
+            "",
+        ),
     }
 )
 
@@ -165,8 +169,11 @@ def _register_services(hass: HomeAssistant) -> None:
         }
 
         current_lum: float | None = call.data.get(ATTR_LUM)
-        last_state: CoverStateType = call.data.get(ATTR_PREVIOUS_STATE, "open")
-
+        
+        raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
+        
+        last_state: CoverStateType = raw_prev_state if raw_prev_state in VALID_STATES else "open"
+        
         if sun_alt <= 0.0:
             return {
                 "result": "open",
