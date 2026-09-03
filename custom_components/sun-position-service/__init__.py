@@ -30,12 +30,12 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 GeomResultType = Literal["direct", "side", "slightly", "open"]
-CoverStateType = Literal["open", "side", "slightly", "direct"]
+CoverStateType = Literal["open", "slightly", "side", "direct"]
 
 VALID_STATES: Final[tuple[CoverStateType, ...]] = (
     "open",
-    "side",
     "slightly",
+    "side",
     "direct",
 )
 
@@ -79,55 +79,75 @@ def _calculate_blind_state(
     sun_altitude: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
-    """Расчет положения шторы с адаптивными порогами ослепления и гистерезисом."""
-    if geom_result == "open" or geom_coverage < 5.0 or lux < 100.0:
+    """Расчет положения шторы с жестким гео-ограничением и гистерезисом по эффективным люксам."""
+    # 1. Солнце ушло с окна, скрылось за горизонт или датчик в полной темноте -> строго ОТКРЫТЬ
+    if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
         return "open"
 
+    # Эффективный поток: отсекает рассеянный свет неба при косых лучах
     effective_lux = lux * (geom_coverage / 100.0)
 
-    # При низком солнце (< 25°) свет проникает глубоко вглубь комнаты
+    # При низком солнце (< 25°) слепит сильнее даже при меньшем потоке
     is_low_sun = 0.0 < sun_altitude <= 25.0
-    side_to_direct_threshold = 8000.0 if is_low_sun else 12000.0
 
-    # 1. Выход из direct (гистерезис на закрытие)
+    # 2. Пороги переключения (вверх / вниз) с явным гистерезисом (anti-flapping)
+    direct_on = 10000.0 if is_low_sun else 14000.0
+    direct_off = 6000.0 if is_low_sun else 8000.0
+
+    side_on = 4000.0
+    side_off = 2200.0
+
+    slightly_on = 1500.0
+    slightly_off = 700.0
+
+    # 3. Желаемое состояние по реальной яркости с учетом текущего положения
     if current_state == "direct":
-        min_lux = 3500.0 if is_low_sun else 4500.0
-        if effective_lux < min_lux or geom_coverage < 25.0:
-            return "side" if geom_result in ("direct", "side") else "slightly"
-        return "direct"
+        if effective_lux >= direct_off:
+            target_state = "direct"
+        elif effective_lux >= side_off:
+            target_state = "side"
+        elif effective_lux >= slightly_off:
+            target_state = "slightly"
+        else:
+            target_state = "open"
 
-    # 2. Выход из side
-    if current_state == "side":
-        # Переход в direct по геометрическому direct ИЛИ по высокой фотометрии при боковом солнце
-        if (effective_lux >= 7000.0 and geom_result == "direct") or (
-            effective_lux >= side_to_direct_threshold and geom_coverage >= 35.0
-        ):
-            return "direct"
-        if effective_lux < 1200.0:
-            return "open"
-        return "side"
+    elif current_state == "side":
+        if effective_lux >= direct_on:
+            target_state = "direct"
+        elif effective_lux >= side_off:
+            target_state = "side"
+        elif effective_lux >= slightly_off:
+            target_state = "slightly"
+        else:
+            target_state = "open"
 
-    # 3. Выход из slightly
-    if current_state == "slightly":
-        if (effective_lux >= 8000.0 and geom_result == "direct") or (
-            effective_lux >= side_to_direct_threshold and geom_coverage >= 40.0
-        ):
-            return "direct"
-        if effective_lux < 800.0:
-            return "open"
-        return "slightly"
+    elif current_state == "slightly":
+        if effective_lux >= direct_on:
+            target_state = "direct"
+        elif effective_lux >= side_on:
+            target_state = "side"
+        elif effective_lux >= slightly_off:
+            target_state = "slightly"
+        else:
+            target_state = "open"
 
-    # 4. Базовый переход из open
-    if (effective_lux >= 6000.0 and geom_result == "direct") or (
-        effective_lux >= side_to_direct_threshold and geom_coverage >= 35.0
-    ):
-        return "direct"
-    if effective_lux >= 2000.0 and geom_result in ("direct", "side"):
-        return "side"
-    if effective_lux >= 800.0 and geom_result in ("side", "slightly"):
-        return "slightly"
+    else:  # current_state == "open"
+        if effective_lux >= direct_on:
+            target_state = "direct"
+        elif effective_lux >= side_on:
+            target_state = "side"
+        elif effective_lux >= slightly_on:
+            target_state = "slightly"
+        else:
+            target_state = "open"
 
-    return "open"
+    # 4. Геометрия ограничивает максимальную степень закрытия
+    allowed_order: list[CoverStateType] = ["open", "slightly", "side", "direct"]
+    max_allowed_idx = allowed_order.index(geom_result)
+    target_idx = allowed_order.index(target_state)
+
+    final_idx = min(target_idx, max_allowed_idx)
+    return allowed_order[final_idx]
 
 
 SERVICE_SCHEMA = vol.Schema(
@@ -169,11 +189,13 @@ def _register_services(hass: HomeAssistant) -> None:
         }
 
         current_lum: float | None = call.data.get(ATTR_LUM)
-        
+
+        # Безопасная обработка None / пустых значений из YAML и автоматизаций
         raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
-        
-        last_state: CoverStateType = raw_prev_state if raw_prev_state in VALID_STATES else "open"
-        
+        last_state: CoverStateType = (
+            raw_prev_state if raw_prev_state in VALID_STATES else "open"
+        )
+
         if sun_alt <= 0.0:
             return {
                 "result": "open",
