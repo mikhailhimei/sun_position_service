@@ -120,7 +120,7 @@ def _calculate_blind_state(
     sun_altitude: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
-    """Расчет положения шторы с жестким гео-ограничением и гистерезисом по эффективным люксам."""
+    """Расчет положения шторы с адаптивным гео-ограничением и гистерезисом по эффективным люксам."""
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
         return "open"
 
@@ -176,12 +176,18 @@ def _calculate_blind_state(
         else:
             target_state = "open"
 
-    allowed_order: list[CoverStateType] = ["open", "slightly", "side", "direct"]
-    max_allowed_idx = allowed_order.index(geom_result)
-    target_idx = allowed_order.index(target_state)
+    # --- ГЕО-ОТСЕЧКА ---
+    # 1. Солнце ушло из окна — безусловно открыть
+    if geom_result == "open":
+        return "open"
 
-    final_idx = min(target_idx, max_allowed_idx)
-    return allowed_order[final_idx]
+    # 2. Солнце на самом краю окна — максимум слегка прикрыть
+    if geom_result == "slightly":
+        return "slightly" if target_state != "open" else "open"
+
+    # 3. В рабочей зоне окна (side / direct) доверяем расчету по люксам:
+    # если свет реально слепит глаза, штора имеет право закрыться в direct
+    return target_state
 
 
 SERVICE_SCHEMA = vol.Schema(
@@ -245,7 +251,6 @@ def _register_services(hass: HomeAssistant) -> None:
         if call.data.get(ATTR_ALL):
             try:
                 s_info = sun(loc.observer, date=base_date, tzinfo=tz)
-                # Берем запас в 30 минут до восхода и после заката
                 start_dt = s_info["sunrise"] - timedelta(minutes=30)
                 end_dt = s_info["sunset"] + timedelta(minutes=30)
             except Exception:
@@ -280,7 +285,6 @@ def _register_services(hass: HomeAssistant) -> None:
                     "geom_result": g_res,
                     "result": res,
                 })
-                # Сохраняем состояние для отработки гистерезиса на следующем шаге
                 running_state = res
                 curr_dt += step
 
