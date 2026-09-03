@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import logging
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from astral import LocationInfo
-from astral.sun import azimuth, elevation
+from astral.sun import azimuth, elevation, sun
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
@@ -28,6 +29,10 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Дополнительные ключи для отладки
+ATTR_DATE: Final = "date"
+ATTR_ALL: Final = "all"
 
 GeomResultType = Literal["direct", "side", "slightly", "open"]
 CoverStateType = Literal["open", "slightly", "side", "direct"]
@@ -72,6 +77,42 @@ def _calculate_single_azimuth_coverage(
     return base * _get_altitude_factor(sun_alt)
 
 
+def _compute_coverage(az_list: list[float], sun_az: float, sun_alt: float) -> float:
+    """Вспомогательная функция вычисления покрытия по геометрии."""
+    if not az_list or sun_alt <= 0.0:
+        return 0.0
+
+    if len(az_list) == 1:
+        coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, az_list[0])
+    else:
+        start, end = min(az_list), max(az_list)
+        width = end - start
+
+        if width == 0.0:
+            coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, start)
+        elif sun_az < start or sun_az > end:
+            return 0.0
+        else:
+            center = (start + end) / 2.0
+            distance = abs(sun_az - center)
+            half = width / 2.0
+            azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / half)))
+            coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
+
+    return round(max(0.0, min(100.0, coverage)), 1)
+
+
+def _coverage_to_geom_result(coverage: float) -> GeomResultType:
+    """Определение категории геометрического результата."""
+    if coverage >= 70.0:
+        return "direct"
+    if coverage >= 35.0:
+        return "side"
+    if coverage > 10.0:
+        return "slightly"
+    return "open"
+
+
 def _calculate_blind_state(
     geom_coverage: float,
     geom_result: GeomResultType,
@@ -80,17 +121,12 @@ def _calculate_blind_state(
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
     """Расчет положения шторы с жестким гео-ограничением и гистерезисом по эффективным люксам."""
-    # 1. Солнце ушло с окна, скрылось за горизонт или датчик в полной темноте -> строго ОТКРЫТЬ
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
         return "open"
 
-    # Эффективный поток: отсекает рассеянный свет неба при косых лучах
     effective_lux = lux * (geom_coverage / 100.0)
-
-    # При низком солнце (< 25°) слепит сильнее даже при меньшем потоке
     is_low_sun = 0.0 < sun_altitude <= 25.0
 
-    # 2. Пороги переключения (вверх / вниз) с явным гистерезисом (anti-flapping)
     direct_on = 10000.0 if is_low_sun else 14000.0
     direct_off = 6000.0 if is_low_sun else 8000.0
 
@@ -100,7 +136,6 @@ def _calculate_blind_state(
     slightly_on = 1500.0
     slightly_off = 700.0
 
-    # 3. Желаемое состояние по реальной яркости с учетом текущего положения
     if current_state == "direct":
         if effective_lux >= direct_off:
             target_state = "direct"
@@ -141,7 +176,6 @@ def _calculate_blind_state(
         else:
             target_state = "open"
 
-    # 4. Геометрия ограничивает максимальную степень закрытия
     allowed_order: list[CoverStateType] = ["open", "slightly", "side", "direct"]
     max_allowed_idx = allowed_order.index(geom_result)
     target_idx = allowed_order.index(target_state)
@@ -161,6 +195,9 @@ SERVICE_SCHEMA = vol.Schema(
             None,
             "",
         ),
+        # Скрытые сервисные параметры (доступны только через YAML)
+        vol.Optional(ATTR_DATE): vol.Any(cv_string := str, None),
+        vol.Optional(ATTR_ALL, default=False): vol.Coerce(bool),
     }
 )
 
@@ -171,6 +208,7 @@ def _register_services(hass: HomeAssistant) -> None:
         return
 
     def handle_get_state(call: ServiceCall) -> ServiceResponse:
+        tz = dt_util.get_time_zone(hass.config.time_zone or "UTC")
         loc = LocationInfo(
             name=hass.config.location_name or "Home",
             region="HomeAssistant",
@@ -179,32 +217,21 @@ def _register_services(hass: HomeAssistant) -> None:
             longitude=float(hass.config.longitude),
         )
 
-        now_dt = dt_util.now()
-        sun_az = float(azimuth(loc.observer, now_dt))
-        sun_alt = float(elevation(loc.observer, now_dt))
-
-        sun_info = {
-            "sun_azimuth": round(sun_az, 1),
-            "sun_altitude": round(sun_alt, 1),
-        }
+        # Парсим дату или берем текущее время
+        date_str = call.data.get(ATTR_DATE)
+        if date_str:
+            try:
+                base_date = datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                base_date = dt_util.now().date()
+        else:
+            base_date = dt_util.now().date()
 
         current_lum: float | None = call.data.get(ATTR_LUM)
-
-        # Безопасная обработка None / пустых значений из YAML и автоматизаций
         raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
         last_state: CoverStateType = (
             raw_prev_state if raw_prev_state in VALID_STATES else "open"
         )
-
-        if sun_alt <= 0.0:
-            return {
-                "result": "open",
-                "geom_result": "open",
-                "coverage": 0.0,
-                "effective_lux": 0.0,
-                "lum": current_lum,
-                **sun_info,
-            }
 
         raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
         if raw_azimuths is None:
@@ -214,54 +241,68 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             az_list = [float(x) for x in raw_azimuths]
 
-        if not az_list:
+        # --- РЕЖИМ ОТЛАДКИ: ВСЕ ТОЧКИ ДНЯ (all: true) ---
+        if call.data.get(ATTR_ALL):
+            try:
+                s_info = sun(loc.observer, date=base_date, tzinfo=tz)
+                # Берем запас в 30 минут до восхода и после заката
+                start_dt = s_info["sunrise"] - timedelta(minutes=30)
+                end_dt = s_info["sunset"] + timedelta(minutes=30)
+            except Exception:
+                start_dt = datetime.combine(base_date, datetime.min.time(), tzinfo=tz)
+                end_dt = datetime.combine(base_date, datetime.max.time(), tzinfo=tz)
+
+            step = timedelta(minutes=15)
+            curr_dt = start_dt
+            running_state = last_state
+            timeline: list[dict[str, Any]] = []
+
+            while curr_dt <= end_dt:
+                s_az = float(azimuth(loc.observer, curr_dt))
+                s_alt = float(elevation(loc.observer, curr_dt))
+
+                cov = _compute_coverage(az_list, s_az, s_alt)
+                g_res = _coverage_to_geom_result(cov)
+
+                if current_lum is not None:
+                    eff_lux = round(current_lum * (cov / 100.0), 1)
+                    res = _calculate_blind_state(cov, g_res, current_lum, s_alt, running_state)
+                else:
+                    eff_lux = 0.0
+                    res = g_res
+
+                timeline.append({
+                    "time": curr_dt.strftime("%H:%M"),
+                    "sun_azimuth": round(s_az, 1),
+                    "sun_altitude": round(s_alt, 1),
+                    "coverage": cov,
+                    "effective_lux": eff_lux,
+                    "geom_result": g_res,
+                    "result": res,
+                })
+                # Сохраняем состояние для отработки гистерезиса на следующем шаге
+                running_state = res
+                curr_dt += step
+
             return {
-                "result": "open",
-                "geom_result": "open",
-                "coverage": 0.0,
-                "effective_lux": 0.0,
-                "lum": current_lum,
-                **sun_info,
+                "date": base_date.strftime("%Y-%m-%d"),
+                "lum_tested": current_lum,
+                "points_count": len(timeline),
+                "timeline": timeline,
             }
 
-        if len(az_list) == 1:
-            coverage = _calculate_single_azimuth_coverage(
-                sun_az, sun_alt, az_list[0]
-            )
-        else:
-            start, end = min(az_list), max(az_list)
-            width = end - start
+        # --- ОБЫЧНЫЙ РЕЖИМ: ОДНО ТЕКУЩЕЕ ЗНАЧЕНИЕ ---
+        now_dt = dt_util.now()
+        sun_az = float(azimuth(loc.observer, now_dt))
+        sun_alt = float(elevation(loc.observer, now_dt))
 
-            if width == 0.0:
-                coverage = _calculate_single_azimuth_coverage(
-                    sun_az, sun_alt, start
-                )
-            elif sun_az < start or sun_az > end:
-                return {
-                    "result": "open",
-                    "geom_result": "open",
-                    "coverage": 0.0,
-                    "effective_lux": 0.0,
-                    "lum": current_lum,
-                    **sun_info,
-                }
-            else:
-                center = (start + end) / 2.0
-                distance = abs(sun_az - center)
-                half = width / 2.0
-                azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / half)))
-                coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
+        sun_info = {
+            "sun_azimuth": round(sun_az, 1),
+            "sun_altitude": round(sun_alt, 1),
+        }
 
-        coverage = round(max(0.0, min(100.0, coverage)), 1)
-
-        if coverage >= 70.0:
-            geom_result: GeomResultType = "direct"
-        elif coverage >= 35.0:
-            geom_result: GeomResultType = "side"
-        elif coverage > 10.0:
-            geom_result: GeomResultType = "slightly"
-        else:
-            geom_result = "open"
+        coverage = _compute_coverage(az_list, sun_az, sun_alt)
+        geom_result = _coverage_to_geom_result(coverage)
 
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
