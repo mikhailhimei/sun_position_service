@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 import logging
-from typing import Any, Final, Literal
+from typing import Final, Literal
 
 from astral import LocationInfo
-from astral.sun import azimuth, elevation, sun
+from astral.sun import azimuth, elevation
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
@@ -30,19 +30,47 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Дополнительные ключи для отладки
-ATTR_DATE: Final = "date"
-ATTR_ALL: Final = "all"
-
 GeomResultType = Literal["direct", "side", "slightly", "open"]
-CoverStateType = Literal["open", "slightly", "side", "direct"]
+CoverStateType = Literal["open", "side", "slightly", "direct"]
 
 VALID_STATES: Final[tuple[CoverStateType, ...]] = (
     "open",
-    "slightly",
     "side",
+    "slightly",
     "direct",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdConfig:
+    """Конфигурация порогов фотометрии и геометрии."""
+
+    # 1. Эмпирическое правило сильного залития окна
+    high_coverage_pct: float = 90.0
+    high_coverage_direct_lux: float = 5000.0
+
+    # 2. Правило низкого солнца (слепящий эффект при остром угле к полу)
+    low_altitude_deg: float = 25.0
+    low_altitude_direct_lux: float = 8000.0
+    default_side_direct_lux: float = 12000.0
+    min_side_coverage_pct: float = 35.0
+
+    # 3. Базовые переходы для геометрического direct
+    standard_direct_open_lux: float = 6000.0
+    standard_direct_side_lux: float = 7000.0
+
+    # 4. Гистерезис удержания direct (anti-flapping на открытие)
+    direct_retain_lux_low_alt: float = 3500.0
+    direct_retain_lux_high_alt: float = 4500.0
+    direct_retain_min_coverage: float = 25.0
+
+    # 5. Пороги для side / slightly / open
+    side_min_lux: float = 2000.0
+    side_exit_lux: float = 1200.0
+    slightly_min_lux: float = 800.0
+
+
+THRESHOLDS: Final = ThresholdConfig()
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -52,7 +80,7 @@ def _angle_diff(a: float, b: float) -> float:
 
 
 def _get_altitude_factor(sun_altitude: float) -> float:
-    """Коэффициент проникновения солнечного потока в зависимости от высоты."""
+    """Коэффициент проникновения солнечного потока в проем в зависимости от высоты."""
     if sun_altitude <= 0.0:
         return 0.0
     if sun_altitude < 5.0:
@@ -77,40 +105,56 @@ def _calculate_single_azimuth_coverage(
     return base * _get_altitude_factor(sun_alt)
 
 
-def _compute_coverage(az_list: list[float], sun_az: float, sun_alt: float) -> float:
-    """Вспомогательная функция вычисления покрытия по геометрии."""
-    if not az_list or sun_alt <= 0.0:
+def _calculate_range_azimuth_coverage(
+    sun_az: float, sun_alt: float, start: float, end: float
+) -> float:
+    """Расчет покрытия для диапазона азимутов с корректной обработкой перехода через 0/360."""
+    span = (end - start) % 360.0
+    if span == 0.0:
+        return _calculate_single_azimuth_coverage(sun_az, sun_alt, start)
+
+    offset = (sun_az - start) % 360.0
+    if offset > span:
         return 0.0
 
-    if len(az_list) == 1:
-        coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, az_list[0])
-    else:
-        start, end = min(az_list), max(az_list)
-        width = end - start
-
-        if width == 0.0:
-            coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, start)
-        elif sun_az < start or sun_az > end:
-            return 0.0
-        else:
-            center = (start + end) / 2.0
-            distance = abs(sun_az - center)
-            half = width / 2.0
-            azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / half)))
-            coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
-
-    return round(max(0.0, min(100.0, coverage)), 1)
+    center_offset = span / 2.0
+    distance = abs(offset - center_offset)
+    azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / center_offset)))
+    return azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
 
 
-def _coverage_to_geom_result(coverage: float) -> GeomResultType:
-    """Определение категории геометрического результата."""
-    if coverage >= 70.0:
-        return "direct"
-    if coverage >= 35.0:
-        return "side"
-    if coverage > 10.0:
-        return "slightly"
-    return "open"
+def _should_trigger_direct(
+    geom_result: GeomResultType,
+    effective_lux: float,
+    coverage: float,
+    sun_altitude: float,
+    from_state: CoverStateType,
+) -> bool:
+    """Предикат проверки условий перехода в режим direct."""
+    # 1. Залитие окна >= 90% и люксы >= 5000
+    if coverage >= THRESHOLDS.high_coverage_pct and effective_lux >= THRESHOLDS.high_coverage_direct_lux:
+        return True
+
+    # 2. Стандартный direct по геометрии
+    direct_min_lux = (
+        THRESHOLDS.standard_direct_side_lux
+        if from_state in ("side", "slightly")
+        else THRESHOLDS.standard_direct_open_lux
+    )
+    if geom_result == "direct" and effective_lux >= direct_min_lux:
+        return True
+
+    # 3. Боковой свет высокой интенсивности (ослепление низким или ярким солнцем)
+    is_low_sun = 0.0 < sun_altitude <= THRESHOLDS.low_altitude_deg
+    glare_lux_limit = (
+        THRESHOLDS.low_altitude_direct_lux
+        if is_low_sun
+        else THRESHOLDS.default_side_direct_lux
+    )
+    if coverage >= THRESHOLDS.min_side_coverage_pct and effective_lux >= glare_lux_limit:
+        return True
+
+    return False
 
 
 def _calculate_blind_state(
@@ -120,74 +164,47 @@ def _calculate_blind_state(
     sun_altitude: float,
     current_state: CoverStateType = "open",
 ) -> CoverStateType:
-    """Расчет положения шторы с адаптивным гео-ограничением и гистерезисом по эффективным люксам."""
-    if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
+    """Расчет положения шторы с адаптивными порогами ослепления и гистерезисом."""
+    if geom_result == "open" or geom_coverage < 5.0 or lux < 100.0:
         return "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
-    is_low_sun = 0.0 < sun_altitude <= 25.0
+    is_low_sun = 0.0 < sun_altitude <= THRESHOLDS.low_altitude_deg
 
-    direct_on = 10000.0 if is_low_sun else 14000.0
-    direct_off = 6000.0 if is_low_sun else 8000.0
-
-    side_on = 4000.0
-    side_off = 2200.0
-
-    slightly_on = 1500.0
-    slightly_off = 700.0
-
+    # 1. Гистерезис удержания direct
     if current_state == "direct":
-        if effective_lux >= direct_off:
-            target_state = "direct"
-        elif effective_lux >= side_off:
-            target_state = "side"
-        elif effective_lux >= slightly_off:
-            target_state = "slightly"
-        else:
-            target_state = "open"
+        retain_lux = (
+            THRESHOLDS.direct_retain_lux_low_alt
+            if is_low_sun
+            else THRESHOLDS.direct_retain_lux_high_alt
+        )
+        if effective_lux < retain_lux or geom_coverage < THRESHOLDS.direct_retain_min_coverage:
+            return "side" if geom_result in ("direct", "side") else "slightly"
+        return "direct"
 
-    elif current_state == "side":
-        if effective_lux >= direct_on:
-            target_state = "direct"
-        elif effective_lux >= side_off:
-            target_state = "side"
-        elif effective_lux >= slightly_off:
-            target_state = "slightly"
-        else:
-            target_state = "open"
+    # 2. Централизованный переход в direct
+    if _should_trigger_direct(geom_result, effective_lux, geom_coverage, sun_altitude, current_state):
+        return "direct"
 
-    elif current_state == "slightly":
-        if effective_lux >= direct_on:
-            target_state = "direct"
-        elif effective_lux >= side_on:
-            target_state = "side"
-        elif effective_lux >= slightly_off:
-            target_state = "slightly"
-        else:
-            target_state = "open"
+    # 3. Выход / удержание в side
+    if current_state == "side":
+        if effective_lux < THRESHOLDS.side_exit_lux:
+            return "open"
+        return "side"
 
-    else:  # current_state == "open"
-        if effective_lux >= direct_on:
-            target_state = "direct"
-        elif effective_lux >= side_on:
-            target_state = "side"
-        elif effective_lux >= slightly_on:
-            target_state = "slightly"
-        else:
-            target_state = "open"
+    # 4. Выход / удержание в slightly
+    if current_state == "slightly":
+        if effective_lux < THRESHOLDS.slightly_min_lux:
+            return "open"
+        return "slightly"
 
-    # --- ГЕО-ОТСЕЧКА ---
-    # 1. Солнце ушло из окна — безусловно открыть
-    if geom_result == "open":
-        return "open"
+    # 5. Базовый подъем из open
+    if effective_lux >= THRESHOLDS.side_min_lux and geom_result in ("direct", "side"):
+        return "side"
+    if effective_lux >= THRESHOLDS.slightly_min_lux and geom_result in ("side", "slightly"):
+        return "slightly"
 
-    # 2. Солнце на самом краю окна — максимум слегка прикрыть
-    if geom_result == "slightly":
-        return "slightly" if target_state != "open" else "open"
-
-    # 3. В рабочей зоне окна (side / direct) доверяем расчету по люксам:
-    # если свет реально слепит глаза, штора имеет право закрыться в direct
-    return target_state
+    return "open"
 
 
 SERVICE_SCHEMA = vol.Schema(
@@ -196,14 +213,7 @@ SERVICE_SCHEMA = vol.Schema(
             vol.Coerce(float), [vol.Coerce(float)], None
         ),
         vol.Optional(ATTR_LUM): vol.Any(vol.Coerce(float), None),
-        vol.Optional(ATTR_PREVIOUS_STATE, default="open"): vol.Any(
-            vol.In(VALID_STATES),
-            None,
-            "",
-        ),
-        # Скрытые сервисные параметры (доступны только через YAML)
-        vol.Optional(ATTR_DATE): vol.Any(cv_string := str, None),
-        vol.Optional(ATTR_ALL, default=False): vol.Coerce(bool),
+        vol.Optional(ATTR_PREVIOUS_STATE, default="open"): vol.In(VALID_STATES),
     }
 )
 
@@ -214,7 +224,6 @@ def _register_services(hass: HomeAssistant) -> None:
         return
 
     def handle_get_state(call: ServiceCall) -> ServiceResponse:
-        tz = dt_util.get_time_zone(hass.config.time_zone or "UTC")
         loc = LocationInfo(
             name=hass.config.location_name or "Home",
             region="HomeAssistant",
@@ -223,79 +232,6 @@ def _register_services(hass: HomeAssistant) -> None:
             longitude=float(hass.config.longitude),
         )
 
-        # Парсим дату или берем текущее время
-        date_str = call.data.get(ATTR_DATE)
-        if date_str:
-            try:
-                base_date = datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
-            except ValueError:
-                base_date = dt_util.now().date()
-        else:
-            base_date = dt_util.now().date()
-
-        current_lum: float | None = call.data.get(ATTR_LUM)
-        raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
-        last_state: CoverStateType = (
-            raw_prev_state if raw_prev_state in VALID_STATES else "open"
-        )
-
-        raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
-        if raw_azimuths is None:
-            az_list: list[float] = []
-        elif isinstance(raw_azimuths, (int, float)):
-            az_list = [float(raw_azimuths)]
-        else:
-            az_list = [float(x) for x in raw_azimuths]
-
-        # --- РЕЖИМ ОТЛАДКИ: ВСЕ ТОЧКИ ДНЯ (all: true) ---
-        if call.data.get(ATTR_ALL):
-            try:
-                s_info = sun(loc.observer, date=base_date, tzinfo=tz)
-                start_dt = s_info["sunrise"] - timedelta(minutes=30)
-                end_dt = s_info["sunset"] + timedelta(minutes=30)
-            except Exception:
-                start_dt = datetime.combine(base_date, datetime.min.time(), tzinfo=tz)
-                end_dt = datetime.combine(base_date, datetime.max.time(), tzinfo=tz)
-
-            step = timedelta(minutes=15)
-            curr_dt = start_dt
-            running_state = last_state
-            timeline: list[dict[str, Any]] = []
-
-            while curr_dt <= end_dt:
-                s_az = float(azimuth(loc.observer, curr_dt))
-                s_alt = float(elevation(loc.observer, curr_dt))
-
-                cov = _compute_coverage(az_list, s_az, s_alt)
-                g_res = _coverage_to_geom_result(cov)
-
-                if current_lum is not None:
-                    eff_lux = round(current_lum * (cov / 100.0), 1)
-                    res = _calculate_blind_state(cov, g_res, current_lum, s_alt, running_state)
-                else:
-                    eff_lux = 0.0
-                    res = g_res
-
-                timeline.append({
-                    "time": curr_dt.strftime("%H:%M"),
-                    "sun_azimuth": round(s_az, 1),
-                    "sun_altitude": round(s_alt, 1),
-                    "coverage": cov,
-                    "effective_lux": eff_lux,
-                    "geom_result": g_res,
-                    "result": res,
-                })
-                running_state = res
-                curr_dt += step
-
-            return {
-                "date": base_date.strftime("%Y-%m-%d"),
-                "lum_tested": current_lum,
-                "points_count": len(timeline),
-                "timeline": timeline,
-            }
-
-        # --- ОБЫЧНЫЙ РЕЖИМ: ОДНО ТЕКУЩЕЕ ЗНАЧЕНИЕ ---
         now_dt = dt_util.now()
         sun_az = float(azimuth(loc.observer, now_dt))
         sun_alt = float(elevation(loc.observer, now_dt))
@@ -305,9 +241,61 @@ def _register_services(hass: HomeAssistant) -> None:
             "sun_altitude": round(sun_alt, 1),
         }
 
-        coverage = _compute_coverage(az_list, sun_az, sun_alt)
-        geom_result = _coverage_to_geom_result(coverage)
+        current_lum: float | None = call.data.get(ATTR_LUM)
+        last_state: CoverStateType = call.data.get(ATTR_PREVIOUS_STATE, "open")
 
+        # Ночной режим
+        if sun_alt <= 0.0:
+            return {
+                "result": "open",
+                "geom_result": "open",
+                "coverage": 0.0,
+                "effective_lux": 0.0,
+                "lum": current_lum,
+                **sun_info,
+            }
+
+        raw_azimuths = call.data.get(ATTR_WINDOW_AZIMUTHS)
+        if raw_azimuths is None:
+            az_list: list[float] = []
+        elif isinstance(raw_azimuths, (int, float)):
+            az_list = [float(raw_azimuths)]
+        else:
+            az_list = [float(x) for x in raw_azimuths]
+
+        if not az_list:
+            return {
+                "result": "open",
+                "geom_result": "open",
+                "coverage": 0.0,
+                "effective_lux": 0.0,
+                "lum": current_lum,
+                **sun_info,
+            }
+
+        # Расчет покрытия окна
+        if len(az_list) == 1:
+            coverage = _calculate_single_azimuth_coverage(
+                sun_az, sun_alt, az_list[0]
+            )
+        else:
+            coverage = _calculate_range_azimuth_coverage(
+                sun_az, sun_alt, min(az_list), max(az_list)
+            )
+
+        coverage = round(max(0.0, min(100.0, coverage)), 1)
+
+        # Геометрическая категория
+        if coverage >= 70.0:
+            geom_result: GeomResultType = "direct"
+        elif coverage >= 35.0:
+            geom_result: GeomResultType = "side"
+        elif coverage > 10.0:
+            geom_result: GeomResultType = "slightly"
+        else:
+            geom_result = "open"
+
+        # Фотометрический расчет
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
             result = _calculate_blind_state(
