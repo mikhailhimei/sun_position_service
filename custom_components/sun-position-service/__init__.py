@@ -110,7 +110,7 @@ def _coverage_to_geom_result(coverage: float) -> GeomResultType:
         return "direct"
     if coverage >= 35.0:
         return "side"
-    if coverage >= 20.0:
+    if coverage >= 25.0:
         return "tilted"
     if coverage > 10.0:
         return "slightly"
