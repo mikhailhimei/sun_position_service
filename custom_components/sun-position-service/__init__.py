@@ -66,38 +66,40 @@ def _get_altitude_factor(sun_altitude: float) -> float:
     return 0.4
 
 
-def _calculate_single_azimuth_coverage(
-    sun_az: float, sun_alt: float, target_az: float
+def _compute_coverage(
+    az_list: list[float], sun_az: float, sun_alt: float, fov: float = 55.0
 ) -> float:
-    """Расчет геометрического покрытия для одиночного направления."""
-    diff = _angle_diff(sun_az, target_az)
-    direct_limit = min(max(6.0, 30.0 - sun_alt * 0.6), 20.0)
-    side_limit = direct_limit * 2.5
-    base = 100.0 if diff <= direct_limit else (50.0 if diff <= side_limit else 0.0)
-    return base * _get_altitude_factor(sun_alt)
-
-
-def _compute_coverage(az_list: list[float], sun_az: float, sun_alt: float) -> float:
-    """Вспомогательная функция вычисления покрытия по геометрии."""
+    """Вычисление покрытия: поддерживает одиночный азимут (нормаль окна) или диапазон."""
     if not az_list or sun_alt <= 0.0:
         return 0.0
 
+    # Основной сценарий: передан один азимут (куда смотрит окно)
     if len(az_list) == 1:
-        coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, az_list[0])
-    else:
-        start, end = min(az_list), max(az_list)
-        width = end - start
+        target_az = az_list[0]
+        delta_az = _angle_diff(sun_az, target_az)
 
-        if width == 0.0:
-            coverage = _calculate_single_azimuth_coverage(sun_az, sun_alt, start)
-        elif sun_az < start or sun_az > end:
+        if delta_az >= fov:
             return 0.0
-        else:
-            center = (start + end) / 2.0
-            distance = abs(sun_az - center)
-            half = width / 2.0
-            azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / half)))
-            coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
+
+        azimuth_factor = 1.0 - (delta_az / fov)
+        coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
+        return round(max(0.0, min(100.0, coverage)), 1)
+
+    # Обратная совместимость: если передан диапазон [start, end]
+    start, end = min(az_list), max(az_list)
+    width = end - start
+
+    if width == 0.0:
+        return _compute_coverage([start], sun_az, sun_alt, fov)
+
+    if sun_az < start or sun_az > end:
+        return 0.0
+
+    center = (start + end) / 2.0
+    distance = abs(sun_az - center)
+    half = width / 2.0
+    azimuth_factor = max(0.0, min(1.0, 1.0 - (distance / half)))
+    coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
 
     return round(max(0.0, min(100.0, coverage)), 1)
 
@@ -124,12 +126,12 @@ def _calculate_blind_state(
 ) -> CoverStateType:
     """Расчет положения шторы с гистерезисом по эффективным люксам."""
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
-        # Если штора была в direct, даже при уходе солнца сначала делаем шаг в side
         return "side" if current_state == "direct" else "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
     is_low_sun = 0.0 < sun_altitude <= 25.0
 
+    # Пороги перехода вверх (on) и удержания вниз (off)
     direct_on = 10000.0 if is_low_sun else 14000.0
     direct_off = 6000.0 if is_low_sun else 8000.0
 
@@ -202,7 +204,7 @@ def _calculate_blind_state(
         else:
             target_state = "open"
 
-    # --- ГЕО-ОТСЕЧКА ---
+    # Гео-отсечки
     if geom_result == "open":
         target_state = "open"
     elif geom_result == "slightly":
@@ -212,12 +214,10 @@ def _calculate_blind_state(
         if target_state in ("side", "direct"):
             target_state = "tilted"
 
-    # --- БУФЕРНЫЙ ВЫХОД ИЗ DIRECT ---
-    # Если штора была в direct, а новое состояние требует открытия — сначала строго в side
+    # Обязательный буферный шаг при выходе из direct
     if current_state == "direct" and target_state != "direct":
         return "side"
 
-    # Во всех остальных переходах идем сразу в target_state (например, из side сразу в open)
     return target_state
 
 
@@ -277,7 +277,7 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             az_list = [float(x) for x in raw_azimuths]
 
-        # Режим тестирования всего дня
+        # Режим тестирования всего дня (all: true)
         if call.data.get(ATTR_ALL):
             try:
                 s_info = sun(loc.observer, date=base_date, tzinfo=tz)
