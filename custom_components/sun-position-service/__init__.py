@@ -124,12 +124,12 @@ def _calculate_blind_state(
 ) -> CoverStateType:
     """Расчет положения шторы с гистерезисом по эффективным люксам."""
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
-        return "open"
+        # Если штора была в direct, даже при уходе солнца сначала делаем шаг в side
+        return "side" if current_state == "direct" else "open"
 
     effective_lux = lux * (geom_coverage / 100.0)
     is_low_sun = 0.0 < sun_altitude <= 25.0
 
-    # Пороги перехода вверх (on) и удержания вниз (off)
     direct_on = 10000.0 if is_low_sun else 14000.0
     direct_off = 6000.0 if is_low_sun else 8000.0
 
@@ -204,18 +204,20 @@ def _calculate_blind_state(
 
     # --- ГЕО-ОТСЕЧКА ---
     if geom_result == "open":
-        return "open"
+        target_state = "open"
+    elif geom_result == "slightly":
+        if target_state != "open":
+            target_state = "slightly"
+    elif geom_result == "tilted":
+        if target_state in ("side", "direct"):
+            target_state = "tilted"
 
-    # На самом краю окна не закрываем сильнее slightly
-    if geom_result == "slightly":
-        return "slightly" if target_state != "open" else "open"
+    # --- БУФЕРНЫЙ ВЫХОД ИЗ DIRECT ---
+    # Если штора была в direct, а новое состояние требует открытия — сначала строго в side
+    if current_state == "direct" and target_state != "direct":
+        return "side"
 
-    # В зоне tilted не пускаем в direct, если солнце еще не вошло плотно в окно
-    if geom_result == "tilted":
-        allowed_tilted = ["open", "slightly", "tilted"]
-        return target_state if target_state in allowed_tilted else "tilted"
-
-    # В зонах side и direct слушаемся яркости (включая direct)
+    # Во всех остальных переходах идем сразу в target_state (например, из side сразу в open)
     return target_state
 
 
@@ -262,7 +264,6 @@ def _register_services(hass: HomeAssistant) -> None:
 
         current_lum: float | None = call.data.get(ATTR_LUM)
 
-        # 1. Безопасная обработка null, None, пустых строк и неизвестных состояний
         raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
         last_state: CoverStateType = (
             raw_prev_state if raw_prev_state in VALID_STATES else "open"
@@ -276,7 +277,7 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             az_list = [float(x) for x in raw_azimuths]
 
-        # Режим тестирования всего дня (all: true)
+        # Режим тестирования всего дня
         if call.data.get(ATTR_ALL):
             try:
                 s_info = sun(loc.observer, date=base_date, tzinfo=tz)
@@ -328,7 +329,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 "timeline": timeline,
             }
 
-        # Обычный срез на текущий момент
+        # Обычный вызов
         now_dt = dt_util.now()
         sun_az = float(azimuth(loc.observer, now_dt))
         sun_alt = float(elevation(loc.observer, now_dt))
