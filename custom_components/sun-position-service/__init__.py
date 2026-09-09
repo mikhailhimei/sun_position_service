@@ -108,9 +108,9 @@ def _coverage_to_geom_result(coverage: float) -> GeomResultType:
     """Определение категории геометрического результата."""
     if coverage >= 70.0:
         return "direct"
-    if coverage >= 35.0:
+    if coverage >= 45.0:
         return "side"
-    if coverage >= 25.0:
+    if coverage >= 30.0:
         return "tilted"
     if coverage > 10.0:
         return "slightly"
