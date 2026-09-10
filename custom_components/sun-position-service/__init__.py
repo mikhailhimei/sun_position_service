@@ -110,7 +110,7 @@ def _coverage_to_geom_result(coverage: float) -> GeomResultType:
         return "side"
     if coverage >= 30.0:  # Компактный сектор для tilted (25%..45%)
         return "tilted"
-    if coverage > 10.0:
+    if coverage > 15.0:
         return "slightly"
     return "open"
 
