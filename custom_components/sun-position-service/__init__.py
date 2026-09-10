@@ -69,11 +69,10 @@ def _get_altitude_factor(sun_altitude: float) -> float:
 def _compute_coverage(
     az_list: list[float], sun_az: float, sun_alt: float, fov: float = 55.0
 ) -> float:
-    """Вычисление покрытия: поддерживает одиночный азимут (нормаль окна) или диапазон."""
+    """Вычисление покрытия: одиночный азимут (нормаль окна) или диапазон."""
     if not az_list or sun_alt <= 0.0:
         return 0.0
 
-    # Основной сценарий: передан один азимут (куда смотрит окно)
     if len(az_list) == 1:
         target_az = az_list[0]
         delta_az = _angle_diff(sun_az, target_az)
@@ -85,7 +84,6 @@ def _compute_coverage(
         coverage = azimuth_factor * _get_altitude_factor(sun_alt) * 100.0
         return round(max(0.0, min(100.0, coverage)), 1)
 
-    # Обратная совместимость: если передан диапазон [start, end]
     start, end = min(az_list), max(az_list)
     width = end - start
 
@@ -108,9 +106,9 @@ def _coverage_to_geom_result(coverage: float) -> GeomResultType:
     """Определение категории геометрического результата."""
     if coverage >= 70.0:
         return "direct"
-    if coverage >= 45.0:
+    if coverage >= 45.0:  # Порог поднят с 35.0 для своевременного перехода в tilted
         return "side"
-    if coverage >= 30.0:
+    if coverage >= 30.0:  # Компактный сектор для tilted (25%..45%)
         return "tilted"
     if coverage > 10.0:
         return "slightly"
@@ -128,10 +126,14 @@ def _calculate_blind_state(
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
         return "side" if current_state == "direct" else "open"
 
+    # Правило точного попадания по нормали:
+    # если солнце бьет строго по центру окна (coverage >= 97%) и свет >= 2000 lx
+    if geom_coverage >= 97.0 and lux >= 1500.0:
+        return "direct"
+
     effective_lux = lux * (geom_coverage / 100.0)
     is_low_sun = 0.0 < sun_altitude <= 25.0
 
-    # Пороги перехода вверх (on) и удержания вниз (off)
     direct_on = 10000.0 if is_low_sun else 14000.0
     direct_off = 6000.0 if is_low_sun else 8000.0
 
@@ -384,3 +386,4 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Выгрузка интеграции."""
     return True
+    
