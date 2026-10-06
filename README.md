@@ -30,5 +30,21 @@
 
 Пример вызова сервиса в автоматизации:
 ```yaml
-action: sun_position_service.update_position
-data: {}
+action: sun_position_service.get_state
+data:
+  window_azimuths: [40, 135]
+  lum: 4949
+  previous_state: open
+  required_brightness_percent: 150
+response_variable: position_sun
+```
+
+`required_brightness_percent` — требуемая яркость от 1 до 500%, по умолчанию 100%.
+Чем больше значение, тем больше света нужно для закрытия. При 150% порог
+перехода в `side` повышается с 4000 до 6000 эффективных люкс, а порог
+удержания `side` — с 2200 до 3300 люкс. При coverage 89,9% и lum 4949
+результат из `open` изменится с `side` на `tilted`; из `side` останется `side`.
+
+Масштабируются все пороги освещённости, включая правило прямого попадания
+при coverage ≥ 97%. Геометрия, `lum` и `effective_lux` в ответе не меняются.
+Параметр работает и в режиме `all: true`; без `lum` используется только геометрия.
