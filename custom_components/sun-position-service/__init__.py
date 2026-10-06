@@ -32,6 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 
 ATTR_DATE: Final = "date"
 ATTR_ALL: Final = "all"
+ATTR_REQUIRED_BRIGHTNESS: Final = "required_brightness_percent"
 
 GeomResultType = Literal["direct", "side", "tilted", "slightly", "open"]
 CoverStateType = Literal["open", "slightly", "tilted", "side", "direct"]
@@ -121,13 +122,17 @@ def _calculate_blind_state(
     lux: float,
     sun_altitude: float,
     current_state: CoverStateType = "open",
+    required_brightness_percent: float = 100.0,
 ) -> CoverStateType:
     """Расчет положения шторы с гистерезисом по эффективным люксам."""
+    # Нормализуем свет: 150% повышает все пороги освещённости в 1,5 раза.
+    # Геометрия и возвращаемые показания люкс остаются исходными.
+    lux = lux / (required_brightness_percent / 100.0)
     if geom_result == "open" or geom_coverage < 10.0 or lux < 300.0:
         return "side" if current_state == "direct" else "open"
 
     # Правило точного попадания по нормали:
-    # если солнце бьет строго по центру окна (coverage >= 97%) и свет >= 2000 lx
+    # если солнце бьет строго по центру окна (coverage >= 97%) и нормализованный свет >= 1500 lx
     if geom_coverage >= 97.0 and lux >= 1500.0:
         return "direct"
 
@@ -234,6 +239,9 @@ SERVICE_SCHEMA = vol.Schema(
             None,
             "",
         ),
+        vol.Optional(ATTR_REQUIRED_BRIGHTNESS, default=100.0): vol.All(
+            vol.Coerce(float), vol.Range(min=1.0, max=500.0)
+        ),
         vol.Optional(ATTR_DATE): vol.Any(str, None),
         vol.Optional(ATTR_ALL, default=False): vol.Coerce(bool),
     }
@@ -265,6 +273,7 @@ def _register_services(hass: HomeAssistant) -> None:
             base_date = dt_util.now().date()
 
         current_lum: float | None = call.data.get(ATTR_LUM)
+        required_brightness = call.data[ATTR_REQUIRED_BRIGHTNESS]
 
         raw_prev_state = call.data.get(ATTR_PREVIOUS_STATE)
         last_state: CoverStateType = (
@@ -304,7 +313,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 if current_lum is not None:
                     eff_lux = round(current_lum * (cov / 100.0), 1)
                     res = _calculate_blind_state(
-                        cov, g_res, current_lum, s_alt, running_state
+                        cov, g_res, current_lum, s_alt, running_state, required_brightness
                     )
                 else:
                     eff_lux = 0.0
@@ -347,7 +356,7 @@ def _register_services(hass: HomeAssistant) -> None:
         if current_lum is not None:
             effective_lux = round(current_lum * (coverage / 100.0), 1)
             result = _calculate_blind_state(
-                coverage, geom_result, current_lum, sun_alt, last_state
+                coverage, geom_result, current_lum, sun_alt, last_state, required_brightness
             )
         else:
             effective_lux = 0.0

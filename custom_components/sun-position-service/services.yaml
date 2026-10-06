@@ -21,3 +21,15 @@ get_state:
       example: "open | side | slightly | direct"
       selector:
         object:
+    required_brightness_percent:
+      name: "Требуемая яркость, %"
+      description: "100% — текущие пороги; 150% — для закрытия потребуется в 1,5 раза больше света. Влияет на пороги открытия и закрытия, включая прямое попадание солнца. Без lum не применяется."
+      default: 100
+      example: 150
+      selector:
+        number:
+          min: 1
+          max: 500
+          step: 1
+          mode: box
+          unit_of_measurement: "%"
